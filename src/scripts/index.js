@@ -1,8 +1,9 @@
 import p5 from "p5";
 import { mediaPipe } from "./poseModelMediaPipe";
+import { gestureMediaPipe } from "./gestureRecognizerMediaPipe";
 import { initializeCamCapture, updateFeedDimensions } from "./videoFeedUtils";
 import { getMappedLandmarks } from "./landmarksHandler";
-import { saveSnapshot } from "./utils";
+import { saveSnapshot, pulse } from "./utils";
 import typeface from "../assets/fonts/LeagueGothicRegular.ttf";
 
 new p5((sk) => {
@@ -12,25 +13,28 @@ new p5((sk) => {
   const message = "EVERYWHERE IS THE SAME PLACE";
   let messageIndex = 0;
   let drawnLetters = [];
+  const MAX_LETTERS = 300;
   let videoOpacity = 255;
-  let isDrawingEnabled = false;
-  let drawingHand = null; // 'left' or 'right'
+  let drawingHand = null;
+  let drawingActivatedAt = 0;
+  const DRAWING_WARMUP_MS = 1000;
   let accumulatedDistance = 0;
-  let previousActiveX = 0;
-  let previousActiveY = 0;
+  let previousActivePos = null;
+  let smoothX = 0;
+  let smoothY = 0;
+  const EMA_ALPHA = 0.35;
+  const MOVEMENT_THRESHOLD = 3;
 
-  // Gesture timing
-  let earTouchStartTime = 0;
-  let prayerStartTime = 0;
-  let lastLetterEraseTime = 0;
-  let isEarTouching = false;
-  let isPraying = false;
+  let lastVictoryTime = { left: 0, right: 0 };
+  const VICTORY_COOLDOWN = 1000;
 
-  // Crossing detection
-  let leftHandBelowChest = false;
-  let rightHandBelowChest = false;
-  let leftCrossCount = 0;
-  let rightCrossCount = 0;
+  // Both-fists erase: must be held to avoid accidental trigger.
+  // Timer only resets if neither hand shows a fist, to tolerate momentary mis-reads.
+  let bothFistsStartTime = 0;
+  const ERASE_HOLD_MS = 800;
+
+  let lastThumbDownTime = 0;
+  const THUMB_DOWN_COOLDOWN = 500;
 
   sk.preload = () => {
     type = sk.loadFont(typeface);
@@ -42,7 +46,36 @@ new p5((sk) => {
     sk.textFont(type);
     sk.textAlign(sk.CENTER, sk.CENTER);
     sk.noStroke();
-    camFeed = initializeCamCapture(sk, mediaPipe);
+    camFeed = initializeCamCapture(sk, [mediaPipe, gestureMediaPipe]);
+  };
+
+  const getGesturesPerHand = () => {
+    const result = [];
+    for (let i = 0; i < gestureMediaPipe.gestures.length; i++) {
+      const gesture = gestureMediaPipe.gestures[i]?.[0]?.categoryName;
+      const hand = gestureMediaPipe.handedness[i]?.[0]?.displayName;
+      if (gesture && hand) result.push({ gesture, hand });
+    }
+    return result;
+  };
+
+  const activateHand = (hand, now) => {
+    lastVictoryTime[hand] = now;
+    drawingHand = hand;
+    drawingActivatedAt = now;
+    accumulatedDistance = 0;
+    previousActivePos = null;
+    smoothX = 0;
+    smoothY = 0;
+  };
+
+  const deactivateHand = () => {
+    drawingHand = null;
+    drawingActivatedAt = 0;
+    accumulatedDistance = 0;
+    previousActivePos = null;
+    smoothX = 0;
+    smoothY = 0;
   };
 
   sk.draw = () => {
@@ -56,216 +89,151 @@ new p5((sk) => {
         camFeed.x || 0,
         camFeed.y || 0,
         camFeed.scaledWidth || sk.width,
-        camFeed.scaledHeight || sk.height
+        camFeed.scaledHeight || sk.height,
       );
       sk.noTint();
       sk.pop();
     }
 
-    // Get landmarks
-    const landmarksIndex = [7, 8, 11, 12, 21, 22];
-    const LM = getMappedLandmarks(sk, mediaPipe, camFeed, landmarksIndex);
+    const LM = getMappedLandmarks(sk, mediaPipe, camFeed, [21, 22]);
 
-    // Heart center (between landmarks 11 and 12, slightly lower)
-    const heartCenterX = (LM.X11 + LM.X12) / 2;
-    const heartCenterY = (LM.Y11 + LM.Y12) / 2 + 40;
+    const detected = getGesturesPerHand();
+    const now = sk.millis();
 
-    // Distances for gesture detection
-    const leftHandToEar = sk.dist(LM.X21, LM.Y21, LM.X7, LM.Y7);
-    const rightHandToEar = sk.dist(LM.X22, LM.Y22, LM.X8, LM.Y8);
-    const handsTogether = sk.dist(LM.X21, LM.Y21, LM.X22, LM.Y22);
+    const leftHandGesture = detected.find((d) => d.hand === "Left")?.gesture;
+    const rightHandGesture = detected.find((d) => d.hand === "Right")?.gesture;
 
-    // Crossing gesture detection for activation/deactivation
-    const leftHandNearChestX = Math.abs(LM.X21 - heartCenterX) < 80;
-    const rightHandNearChestX = Math.abs(LM.X22 - heartCenterX) < 80;
+    if (leftHandGesture === "Victory" && now - lastVictoryTime.left > VICTORY_COOLDOWN) {
+      activateHand("left", now);
+    }
+    if (rightHandGesture === "Victory" && now - lastVictoryTime.right > VICTORY_COOLDOWN) {
+      activateHand("right", now);
+    }
 
-    // Left hand crossing (activates/deactivates right hand)
-    if (leftHandNearChestX) {
-      if (LM.Y21 > heartCenterY + 50 && !leftHandBelowChest) {
-        leftHandBelowChest = true;
-      } else if (LM.Y21 < heartCenterY - 50 && leftHandBelowChest) {
-        leftCrossCount++;
-        leftHandBelowChest = false;
+    const activeHandGesture =
+      drawingHand === "left" ? leftHandGesture : rightHandGesture;
+    if (drawingHand && activeHandGesture === "Closed_Fist") {
+      deactivateHand();
+    }
 
-        // Can always activate right hand, but only deactivate if no hand is drawing or if right hand is currently drawing
-        if (leftCrossCount % 2 === 1) {
-          drawingHand = "right";
-          isDrawingEnabled = true;
-        } else {
-          if (!isDrawingEnabled || drawingHand === "right") {
-            drawingHand = null;
-            isDrawingEnabled = false;
-            accumulatedDistance = 0;
-            previousActiveX = 0;
-            previousActiveY = 0;
-          }
-        }
+    const leftIsFist = leftHandGesture === "Closed_Fist";
+    const rightIsFist = rightHandGesture === "Closed_Fist";
+    const bothFists = leftIsFist && rightIsFist;
+    const eitherFist = leftIsFist || rightIsFist;
+    if (bothFists) {
+      if (bothFistsStartTime === 0) bothFistsStartTime = now;
+      if (now - bothFistsStartTime > ERASE_HOLD_MS) {
+        drawnLetters = [];
+        messageIndex = 0;
+        accumulatedDistance = 0;
+        bothFistsStartTime = 0;
+        deactivateHand();
       }
+    } else if (!eitherFist) {
+      bothFistsStartTime = 0;
     }
 
-    // Right hand crossing (activates/deactivates left hand)
-    if (rightHandNearChestX) {
-      if (LM.Y22 > heartCenterY + 50 && !rightHandBelowChest) {
-        rightHandBelowChest = true;
-      } else if (LM.Y22 < heartCenterY - 50 && rightHandBelowChest) {
-        rightCrossCount++;
-        rightHandBelowChest = false;
-
-        // Can always activate left hand, but only deactivate if no hand is drawing or if left hand is currently drawing
-        if (rightCrossCount % 2 === 1) {
-          drawingHand = "left";
-          isDrawingEnabled = true;
-        } else {
-          if (!isDrawingEnabled || drawingHand === "left") {
-            drawingHand = null;
-            isDrawingEnabled = false;
-            accumulatedDistance = 0;
-            previousActiveX = 0;
-            previousActiveY = 0;
-          }
-        }
-      }
-    }
-
-    // Erase all - both hands to ears for 2 seconds
-    const currentEarTouching = leftHandToEar < 80 && rightHandToEar < 80;
-    if (currentEarTouching && !isEarTouching) {
-      earTouchStartTime = sk.millis();
-      isEarTouching = true;
-    } else if (!currentEarTouching) {
-      isEarTouching = false;
-    }
-
-    if (isEarTouching && sk.millis() - earTouchStartTime > 2000) {
-      drawnLetters = [];
-      messageIndex = 0;
-      accumulatedDistance = 0;
-    }
-
-    // Letter by letter erase - prayer gesture
-    const currentPraying =
-      handsTogether < 100 &&
-      LM.Y21 > heartCenterY - 50 &&
-      LM.Y21 < heartCenterY + 100;
-    if (currentPraying && !isPraying) {
-      prayerStartTime = sk.millis();
-      isPraying = true;
-    } else if (!currentPraying) {
-      isPraying = false;
-    }
-
-    if (isPraying && sk.millis() - lastLetterEraseTime > 750) {
+    const thumbDown = leftHandGesture === "Thumb_Down" || rightHandGesture === "Thumb_Down";
+    if (thumbDown && now - lastThumbDownTime > THUMB_DOWN_COOLDOWN) {
+      lastThumbDownTime = now;
       if (drawnLetters.length > 0) {
         drawnLetters.pop();
         messageIndex = Math.max(0, messageIndex - 1);
-        lastLetterEraseTime = sk.millis();
+        accumulatedDistance = 0;
       }
     }
 
-    // Drawing logic
-    if (isDrawingEnabled && drawingHand) {
-      const currentActiveX = drawingHand === "left" ? LM.X21 : LM.X22;
-      const currentActiveY = drawingHand === "left" ? LM.Y21 : LM.Y22;
+    const isWarmedUp = drawingHand && (now - drawingActivatedAt >= DRAWING_WARMUP_MS);
 
-      const deltaX = currentActiveX - previousActiveX;
-      const deltaY = currentActiveY - previousActiveY;
-      const distanceMoved = sk.sqrt(deltaX * deltaX + deltaY * deltaY);
+    if (isWarmedUp) {
+      const rawX = drawingHand === "left" ? LM.X21 : LM.X22;
+      const rawY = drawingHand === "left" ? LM.Y21 : LM.Y22;
 
-      if (distanceMoved > 0 && previousActiveX !== 0) {
-        accumulatedDistance += distanceMoved;
-        const currentChar = message.charAt(messageIndex % message.length);
-        const velocity = distanceMoved;
-        const minSize = 24;
-        const maxSize = 360;
-        let fontSize = minSize + Math.log(velocity + 1) * 35;
-        fontSize = sk.constrain(fontSize, minSize, maxSize);
-
-        const baseDistance = currentChar === " " ? 50 : 30;
-        const fontSizeRatio = fontSize / minSize;
-        const scalingFactor = 1 + (fontSizeRatio - 1) * 0.2;
-        const requiredDistance = baseDistance * scalingFactor;
-
-        if (accumulatedDistance >= requiredDistance) {
-          if (currentChar !== " ") {
-            drawnLetters.push({
-              char: currentChar,
-              x: currentActiveX,
-              y: currentActiveY,
-              size: fontSize,
-            });
-          }
-          messageIndex++;
-          accumulatedDistance = 0;
+      if (rawX !== undefined) {
+        if (previousActivePos === null) {
+          smoothX = rawX;
+          smoothY = rawY;
+        } else {
+          smoothX = EMA_ALPHA * rawX + (1 - EMA_ALPHA) * smoothX;
+          smoothY = EMA_ALPHA * rawY + (1 - EMA_ALPHA) * smoothY;
         }
-      }
 
-      previousActiveX = currentActiveX;
-      previousActiveY = currentActiveY;
+        if (previousActivePos !== null) {
+          const dx = smoothX - previousActivePos.x;
+          const dy = smoothY - previousActivePos.y;
+          const distanceMoved = sk.sqrt(dx * dx + dy * dy);
+
+          if (distanceMoved > MOVEMENT_THRESHOLD) {
+            accumulatedDistance += distanceMoved;
+            const currentChar = message.charAt(messageIndex % message.length);
+            const minSize = 24;
+            const fontSize = sk.constrain(
+              minSize + Math.log(distanceMoved + 1) * 60,
+              minSize,
+              600,
+            );
+            const requiredDistance =
+              (currentChar === " " ? 50 : 30) *
+              (1 + (fontSize / minSize - 1) * 0.2);
+
+            if (accumulatedDistance >= requiredDistance) {
+              if (currentChar !== " ") {
+                if (drawnLetters.length >= MAX_LETTERS) drawnLetters.shift();
+                drawnLetters.push({
+                  char: currentChar,
+                  x: smoothX,
+                  y: smoothY,
+                  size: fontSize,
+                });
+              }
+              messageIndex++;
+              accumulatedDistance = 0;
+            }
+          }
+        }
+
+        previousActivePos = { x: smoothX, y: smoothY };
+      }
     }
 
-    // Draw letters
     sk.push();
     sk.fill(videoOpacity === 0 ? 0 : 255);
-    for (let letter of drawnLetters) {
+    for (const letter of drawnLetters) {
       sk.textSize(letter.size);
       sk.text(letter.char, letter.x, letter.y);
     }
     sk.pop();
 
-    // Activation status text
     sk.push();
     sk.fill(255);
     sk.textSize(24);
     sk.textAlign(sk.RIGHT, sk.BOTTOM);
     sk.textFont("monospace");
-    let statusText = "";
-    if (isDrawingEnabled && drawingHand === "left") {
-      statusText = "LEFT HAND ACTIVATED";
-    } else if (isDrawingEnabled && drawingHand === "right") {
-      statusText = "RIGHT HAND ACTIVATED";
-    } else {
-      statusText = "NO HAND ACTIVATED";
-    }
+    const statusText = drawingHand
+      ? `${drawingHand.toUpperCase()} HAND ACTIVATED`
+      : "NO HAND ACTIVATED";
     sk.text(statusText, sk.width - 20, sk.height - 20);
     sk.pop();
 
-    // Debug circles
-    sk.push();
-    sk.strokeWeight(2);
-
-    // Hands - filled green if active drawing hand, yellow outline if not
-    if (isDrawingEnabled && drawingHand === "left") {
-      sk.fill("#00ff00");
-      sk.stroke("#00ff00");
-      sk.ellipse(LM.X21, LM.Y21, 24, 24);
-    } else {
-      sk.noFill();
-      sk.stroke("#ffff00");
-      sk.ellipse(LM.X21, LM.Y21, 20, 20);
+    if (drawingHand) {
+      const rawActiveX = drawingHand === "left" ? LM.X21 : LM.X22;
+      const rawActiveY = drawingHand === "left" ? LM.Y21 : LM.Y22;
+      const activeX = isWarmedUp ? smoothX : rawActiveX;
+      const activeY = isWarmedUp ? smoothY : rawActiveY;
+      if (activeX !== undefined) {
+        sk.push();
+        sk.stroke(255, 0, 0);
+        sk.strokeWeight(2);
+        if (isWarmedUp) {
+          sk.fill(255, 0, 0);
+        } else {
+          sk.noFill();
+        }
+        const size = pulse(sk, 16, 32, 60);
+        sk.ellipse(activeX, activeY, size, size);
+        sk.pop();
+      }
     }
-
-    if (isDrawingEnabled && drawingHand === "right") {
-      sk.fill("#00ff00");
-      sk.stroke("#00ff00");
-      sk.ellipse(LM.X22, LM.Y22, 24, 24);
-    } else {
-      sk.noFill();
-      sk.stroke("#ffff00");
-      sk.ellipse(LM.X22, LM.Y22, 20, 20);
-    }
-
-    // Ears
-    sk.noFill();
-    sk.stroke("#ff0000");
-    sk.ellipse(LM.X7, LM.Y7, 16, 16);
-    sk.ellipse(LM.X8, LM.Y8, 16, 16);
-
-    // Heart center
-    sk.noFill();
-    sk.stroke("#0000ff");
-    sk.ellipse(heartCenterX, heartCenterY, 24, 24);
-
-    sk.pop();
   };
 
   sk.windowResized = () => {

@@ -1,6 +1,10 @@
 // Version 2.0 - 23.06.2025
 
-export function initializeCamCapture(sk, mediaPipeHandler) {
+export function initializeCamCapture(sk, mediaPipeHandlerOrHandlers) {
+  const mediaPipeHandlers = Array.isArray(mediaPipeHandlerOrHandlers)
+    ? mediaPipeHandlerOrHandlers
+    : [mediaPipeHandlerOrHandlers].filter(Boolean);
+
   const camFeed = sk.createCapture(
     {
       flipped: true,
@@ -11,11 +15,13 @@ export function initializeCamCapture(sk, mediaPipeHandler) {
         frameRate: { ideal: 30, min: 24 },
       },
     },
-    (stream) => {
-      console.log(stream.getTracks()[0].getSettings());
+    () => {
       updateFeedDimensions(sk, camFeed, false);
-      mediaPipeHandler.predictWebcam(camFeed);
-    }
+
+      mediaPipeHandlers.forEach((handler) => {
+        handler?.predictWebcam?.(camFeed);
+      });
+    },
   );
 
   camFeed.elt.setAttribute("playsinline", "");

@@ -1,10 +1,8 @@
 import { PoseLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+import { WASM_URL } from "./mediaPipeConfig";
 
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task";
-// Use CDN with the exact version we have installed
-const MODEL_URL_WASM =
-  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm";
 
 const NUM_POSES = 1;
 const RUNNING_MODE = "VIDEO";
@@ -17,7 +15,7 @@ export const mediaPipe = {
   worldLandmarks: [],
   initialize: async () => {
     try {
-      const vision = await FilesetResolver.forVisionTasks(MODEL_URL_WASM);
+      const vision = await FilesetResolver.forVisionTasks(WASM_URL);
       poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
         baseOptions: {
           modelAssetPath: MODEL_URL,
@@ -36,7 +34,7 @@ export const mediaPipe = {
         lastVideoTime = video.elt.currentTime;
         const results = await poseLandmarker.detectForVideo(
           video.elt,
-          performance.now()
+          performance.now(),
         );
 
         if (results) {
