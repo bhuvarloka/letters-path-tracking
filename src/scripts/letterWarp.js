@@ -1,5 +1,4 @@
-const GRID_SIZE = 12;
-const RENDER_SIZE = 480;
+import { WARP_GRID_COLS, WARP_GRID_ROWS, GLYPH_RENDER_SIZE } from "./config";
 
 let activeSketch = null;
 const glyphCache = new Map();
@@ -9,13 +8,10 @@ export function initLetterCanvas(sk) {
   glyphCache.clear();
 }
 
-export function buildQuadFromEdges(xLeft, xRight, topLeftY, topRightY, botLeftY, botRightY) {
-  return {
-    tl: { x: xLeft, y: topLeftY },
-    tr: { x: xRight, y: topRightY },
-    br: { x: xRight, y: botRightY },
-    bl: { x: xLeft, y: botLeftY },
-  };
+// topEdge / botEdge: arrays of {x,y} with length >= 2, evenly spaced along the letter width.
+// The warp samples these per grid column so curves in the drawn path are preserved.
+export function buildEdges(topEdge, botEdge) {
+  return { topEdge, botEdge };
 }
 
 export function getGlyphAspect(sk, char, fill = 255) {
@@ -29,20 +25,20 @@ function getGlyphCanvas(sk, char, fill) {
 
   sk.push();
   sk.textFont(sk._typeface);
-  sk.textSize(RENDER_SIZE);
+  sk.textSize(GLYPH_RENDER_SIZE);
   const advance = Math.max(1, Math.ceil(sk.textWidth(char)));
   const ascent = sk.textAscent();
   const descent = sk.textDescent();
   sk.pop();
 
-  const PAD = Math.ceil(RENDER_SIZE * 0.5);
+  const PAD = Math.ceil(GLYPH_RENDER_SIZE * 0.5);
   const bakeW = advance + PAD * 2;
   const bakeH = Math.ceil(ascent + descent) + PAD * 2;
 
   const bake = sk.createGraphics(bakeW, bakeH, sk.P2D);
   bake.pixelDensity(1);
   bake.textFont(sk._typeface);
-  bake.textSize(RENDER_SIZE);
+  bake.textSize(GLYPH_RENDER_SIZE);
   bake.textAlign(sk.LEFT, sk.BASELINE);
   bake.noStroke();
   bake.fill(fill);
@@ -83,48 +79,77 @@ function getGlyphCanvas(sk, char, fill) {
   return g;
 }
 
-export function drawWarpedLetter(sk, letter, videoOpacity) {
-  const { char, quad } = letter;
+function sampleEdge(edge, u) {
+  const last = edge.length - 1;
+  const f = u * last;
+  const i = Math.min(Math.floor(f), last - 1);
+  const t = f - i;
+  const a = edge[i];
+  const b = edge[i + 1];
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+
+function renderWarpedGlyph(sk, letter, videoOpacity, maxColFraction, previewAlpha, color) {
+  const { char, edges } = letter;
   if (activeSketch !== sk) return;
 
   const fill = videoOpacity === 0 ? 0 : 255;
   const glyph = getGlyphCanvas(sk, char, fill);
+  const { topEdge, botEdge } = edges;
 
-  const G = GRID_SIZE;
-  const { tl, tr, br, bl } = quad;
+  const GC = WARP_GRID_COLS;
+  const GR = WARP_GRID_ROWS;
+  const maxCol = Math.max(1, Math.round(maxColFraction * (GC - 1)));
 
   sk.push();
   sk.noStroke();
+  if (previewAlpha !== null) {
+    sk.tint(...color, previewAlpha);
+  } else {
+    sk.tint(...color);
+  }
   sk.texture(glyph);
   sk.beginShape(sk.TRIANGLES);
 
-  for (let row = 0; row < G - 1; row++) {
-    for (let col = 0; col < G - 1; col++) {
-      const pts = [
-        [col, row],
-        [col + 1, row],
-        [col + 1, row + 1],
-        [col, row],
-        [col + 1, row + 1],
-        [col, row + 1],
-      ];
-      for (const [c, r] of pts) {
-        const u = c / (G - 1);
-        const v = r / (G - 1);
-        const topX = (1 - u) * tl.x + u * tr.x;
-        const topY = (1 - u) * tl.y + u * tr.y;
-        const botX = (1 - u) * bl.x + u * br.x;
-        const botY = (1 - u) * bl.y + u * br.y;
-        sk.vertex(
-          (1 - v) * topX + v * botX,
-          (1 - v) * topY + v * botY,
-          u * glyph.width,
-          v * glyph.height,
-        );
-      }
+  for (let row = 0; row < GR - 1; row++) {
+    for (let col = 0; col < maxCol; col++) {
+      const u0 = col / (GC - 1);
+      const u1 = (col + 1) / (GC - 1);
+      const v0 = row / (GR - 1);
+      const v1 = (row + 1) / (GR - 1);
+
+      const tl = sampleEdge(topEdge, u0);
+      const tr = sampleEdge(topEdge, u1);
+      const bl = sampleEdge(botEdge, u0);
+      const br = sampleEdge(botEdge, u1);
+
+      const emit = (topPt, botPt, u, v) => sk.vertex(
+        (1 - v) * topPt.x + v * botPt.x,
+        (1 - v) * topPt.y + v * botPt.y,
+        u * glyph.width,
+        v * glyph.height,
+      );
+
+      emit(tl, bl, u0, v0);
+      emit(tr, br, u1, v0);
+      emit(tr, br, u1, v1);
+      emit(tl, bl, u0, v0);
+      emit(tr, br, u1, v1);
+      emit(tl, bl, u0, v1);
     }
   }
 
   sk.endShape();
+  sk.noTint();
   sk.pop();
+}
+
+// fraction ∈ (0,1]: only render the left `fraction` of the glyph (for live preview).
+export function drawWarpedLetterPartial(sk, letter, videoOpacity, fraction, color) {
+  if (fraction <= 0) return;
+  renderWarpedGlyph(sk, letter, videoOpacity, fraction, 140, color);
+}
+
+export function drawWarpedLetter(sk, letter, videoOpacity, color) {
+  renderWarpedGlyph(sk, letter, videoOpacity, 1, null, color);
 }

@@ -3,12 +3,25 @@ import { gestureMediaPipe } from "./gestureRecognizerMediaPipe";
 import { initializeCamCapture, updateFeedDimensions } from "./videoFeedUtils";
 import { getHandLandmarks } from "./landmarksHandler";
 import { saveSnapshot, pulse } from "./utils";
+import { buildEdges, drawWarpedLetter, drawWarpedLetterPartial, initLetterCanvas, getGlyphAspect } from "./letterWarp";
 import {
-  buildQuadFromEdges,
-  drawWarpedLetter,
-  initLetterCanvas,
-  getGlyphAspect,
-} from "./letterWarp";
+  DRAWING_WARMUP_MS,
+  HAND_ACTIVATE_COOLDOWN_MS,
+  PINCH_CLOSED_THRESHOLD,
+  PINCH_OPEN_THRESHOLD,
+  MIN_LETTER_HEIGHT_PX,
+  LETTER_WIDTH_SCALE,
+  LETTER_GAP_RATIO,
+  SPACE_WIDTH_RATIO,
+  MAX_DRAWN_LETTERS,
+  ERASE_HOLD_MS,
+  THUMB_DOWN_COOLDOWN_MS,
+  SMOOTH_EMA_ALPHA,
+  SPINE_MIN_STEP_PX,
+  WARP_GRID_COLS,
+  LETTER_COLOR,
+  OPEN_PALM_COOLDOWN_MS,
+} from "./config";
 import typeface from "../assets/fonts/LeagueGothicRegular.ttf";
 
 const WRIST = 0;
@@ -23,12 +36,10 @@ new p5((sk) => {
   const message = "EVERYWHERE IS THE SAME PLACE";
   let messageIndex = 0;
   let drawnLetters = [];
-  const MAX_LETTERS = 320;
   let videoOpacity = 255;
 
   let drawingHand = null;
   let drawingActivatedAt = 0;
-  const DRAWING_WARMUP_MS = 1000;
 
   let strokeActive = false;
   let pinchClosedSeen = false;
@@ -39,20 +50,11 @@ new p5((sk) => {
 
   let smoothTop = null;
   let smoothBot = null;
-  const EMA_ALPHA = 0.4;
-
-  const PINCH_CLOSED_RATIO = 0.25;
-  const PINCH_OPEN_RATIO = 0.5;
-  const MIN_LETTER_HEIGHT = 24;
-  const LETTER_TRACKING = 0.05;
-  const SPACE_WIDTH_RATIO = 0.35;
 
   let lastActivateTime = { Left: 0, Right: 0 };
-  const ACTIVATE_COOLDOWN = 1000;
   let bothFistsStartTime = 0;
-  const ERASE_HOLD_MS = 800;
   let lastThumbDownTime = 0;
-  const THUMB_DOWN_COOLDOWN = 500;
+  let lastOpenPalmTime = 0;
 
   const sw = () => sk.width / 2;
   const sh = () => sk.height / 2;
@@ -108,10 +110,9 @@ new p5((sk) => {
     resetStroke();
   };
 
-  const advanceForChar = (char, height) => {
+  const letterWidthForChar = (char, height) => {
     if (char === " ") return height * SPACE_WIDTH_RATIO;
-    const aspect = getGlyphAspect(sk, char);
-    return height * aspect * (1 + LETTER_TRACKING);
+    return height * getGlyphAspect(sk, char) * LETTER_WIDTH_SCALE;
   };
 
   const sampleAt = (path, s) => {
@@ -123,52 +124,52 @@ new p5((sk) => {
         const b = path[i];
         const seg = b.s - a.s;
         const t = seg > 0 ? (s - a.s) / seg : 0;
-        return {
-          x: a.x + (b.x - a.x) * t,
-          y: a.y + (b.y - a.y) * t,
-        };
+        return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
       }
     }
     const last = path[path.length - 1];
     return { x: last.x, y: last.y };
   };
 
+  const buildLetterEdges = (startS, endS) => {
+    const topEdge = [];
+    const botEdge = [];
+    for (let col = 0; col < WARP_GRID_COLS; col++) {
+      const u = col / (WARP_GRID_COLS - 1);
+      const s = startS + u * (endS - startS);
+      const t = sampleAt(topPath, s);
+      const b = sampleAt(botPath, s);
+      topEdge.push({ x: sx(t.x), y: sy(t.y) });
+      botEdge.push({ x: sx(b.x), y: sy(b.y) });
+    }
+    return buildEdges(topEdge, botEdge);
+  };
+
   const commitLetterIfReady = () => {
-    while (messageIndex < Number.MAX_SAFE_INTEGER) {
+    while (true) {
       const char = message.charAt(messageIndex % message.length);
       const startTop = sampleAt(topPath, letterStartS);
       const startBot = sampleAt(botPath, letterStartS);
       if (!startTop || !startBot) return;
 
       const startHeight = Math.max(
-        MIN_LETTER_HEIGHT,
+        MIN_LETTER_HEIGHT_PX,
         Math.hypot(startTop.x - startBot.x, startTop.y - startBot.y),
       );
-      const advance = advanceForChar(char, startHeight);
-      const endS = letterStartS + advance;
+      const letterWidth = letterWidthForChar(char, startHeight);
+      const gap = char === " " ? 0 : startHeight * LETTER_GAP_RATIO;
+      const glyphEndS = letterStartS + letterWidth;
+      const nextStartS = glyphEndS + gap;
 
-      if (spineLen < endS) return;
-
-      const endTop = sampleAt(topPath, endS);
-      const endBot = sampleAt(botPath, endS);
+      if (spineLen < nextStartS) return;
 
       if (char !== " ") {
-        if (drawnLetters.length >= MAX_LETTERS) drawnLetters.shift();
-        drawnLetters.push({
-          char,
-          quad: buildQuadFromEdges(
-            sx(startTop.x),
-            sx(endTop.x),
-            sy(startTop.y),
-            sy(endTop.y),
-            sy(startBot.y),
-            sy(endBot.y),
-          ),
-        });
+        if (drawnLetters.length >= MAX_DRAWN_LETTERS) drawnLetters.shift();
+        drawnLetters.push({ char, edges: buildLetterEdges(letterStartS, glyphEndS) });
       }
 
       messageIndex++;
-      letterStartS = endS;
+      letterStartS = nextStartS;
     }
   };
 
@@ -177,10 +178,10 @@ new p5((sk) => {
       smoothTop = { ...top };
       smoothBot = { ...bot };
     } else {
-      smoothTop.x = EMA_ALPHA * top.x + (1 - EMA_ALPHA) * smoothTop.x;
-      smoothTop.y = EMA_ALPHA * top.y + (1 - EMA_ALPHA) * smoothTop.y;
-      smoothBot.x = EMA_ALPHA * bot.x + (1 - EMA_ALPHA) * smoothBot.x;
-      smoothBot.y = EMA_ALPHA * bot.y + (1 - EMA_ALPHA) * smoothBot.y;
+      smoothTop.x = SMOOTH_EMA_ALPHA * top.x + (1 - SMOOTH_EMA_ALPHA) * smoothTop.x;
+      smoothTop.y = SMOOTH_EMA_ALPHA * top.y + (1 - SMOOTH_EMA_ALPHA) * smoothTop.y;
+      smoothBot.x = SMOOTH_EMA_ALPHA * bot.x + (1 - SMOOTH_EMA_ALPHA) * smoothBot.x;
+      smoothBot.y = SMOOTH_EMA_ALPHA * bot.y + (1 - SMOOTH_EMA_ALPHA) * smoothBot.y;
     }
 
     const midX = (smoothTop.x + smoothBot.x) / 2;
@@ -199,7 +200,7 @@ new p5((sk) => {
     const lastMidY = (lastTop.y + lastBot.y) / 2;
     const ds = Math.hypot(midX - lastMidX, midY - lastMidY);
 
-    if (ds < 1) return;
+    if (ds < SPINE_MIN_STEP_PX) return;
 
     spineLen += ds;
     topPath.push({ x: smoothTop.x, y: smoothTop.y, s: spineLen });
@@ -224,31 +225,21 @@ new p5((sk) => {
     }
 
     const hands = getHandLandmarks(sk, gestureMediaPipe, camFeed, [
-      WRIST,
-      THUMB_TIP,
-      INDEX_TIP,
-      MIDDLE_MCP,
+      WRIST, THUMB_TIP, INDEX_TIP, MIDDLE_MCP,
     ]);
     const gesturesByHand = getGesturesPerHand();
     const now = sk.millis();
 
     const handByName = (name) => hands.find((h) => h.hand === name);
 
-    if (
-      gesturesByHand.Left === "ILoveYou" &&
-      now - lastActivateTime.Left > ACTIVATE_COOLDOWN
-    ) {
+    if (gesturesByHand.Left === "ILoveYou" && now - lastActivateTime.Left > HAND_ACTIVATE_COOLDOWN_MS) {
       activateHand("Left", now);
     }
-    if (
-      gesturesByHand.Right === "ILoveYou" &&
-      now - lastActivateTime.Right > ACTIVATE_COOLDOWN
-    ) {
+    if (gesturesByHand.Right === "ILoveYou" && now - lastActivateTime.Right > HAND_ACTIVATE_COOLDOWN_MS) {
       activateHand("Right", now);
     }
 
-    const activeGesture = drawingHand ? gesturesByHand[drawingHand] : null;
-    if (drawingHand && activeGesture === "Closed_Fist") {
+    if (drawingHand && gesturesByHand[drawingHand] === "Closed_Fist") {
       deactivateHand();
     }
 
@@ -266,10 +257,8 @@ new p5((sk) => {
       bothFistsStartTime = 0;
     }
 
-    const thumbDown =
-      gesturesByHand.Left === "Thumb_Down" ||
-      gesturesByHand.Right === "Thumb_Down";
-    if (thumbDown && now - lastThumbDownTime > THUMB_DOWN_COOLDOWN) {
+    const thumbDown = gesturesByHand.Left === "Thumb_Down" || gesturesByHand.Right === "Thumb_Down";
+    if (thumbDown && now - lastThumbDownTime > THUMB_DOWN_COOLDOWN_MS) {
       lastThumbDownTime = now;
       if (drawnLetters.length > 0) {
         drawnLetters.pop();
@@ -277,11 +266,14 @@ new p5((sk) => {
       }
     }
 
-    const isWarmedUp =
-      drawingHand && now - drawingActivatedAt >= DRAWING_WARMUP_MS;
+    const bothPalmsOpen = gesturesByHand.Left === "Open_Palm" && gesturesByHand.Right === "Open_Palm";
+    if (bothPalmsOpen && now - lastOpenPalmTime > OPEN_PALM_COOLDOWN_MS) {
+      lastOpenPalmTime = now;
+      videoOpacity = videoOpacity === 255 ? 0 : 255;
+    }
 
-    let activeHandData = null;
-    if (drawingHand) activeHandData = handByName(drawingHand);
+    const isWarmedUp = drawingHand && now - drawingActivatedAt >= DRAWING_WARMUP_MS;
+    const activeHandData = drawingHand ? handByName(drawingHand) : null;
 
     if (isWarmedUp && activeHandData) {
       const idx = activeHandData.points[INDEX_TIP];
@@ -298,15 +290,10 @@ new p5((sk) => {
 
         if (!strokeActive) {
           if (!pinchClosedSeen) {
-            if (pinchRatio < PINCH_CLOSED_RATIO) pinchClosedSeen = true;
-          } else if (pinchRatio > PINCH_OPEN_RATIO) {
+            if (pinchRatio < PINCH_CLOSED_THRESHOLD) pinchClosedSeen = true;
+          } else if (pinchRatio > PINCH_OPEN_THRESHOLD) {
+            resetStroke();
             strokeActive = true;
-            topPath = [];
-            botPath = [];
-            spineLen = 0;
-            letterStartS = 0;
-            smoothTop = null;
-            smoothBot = null;
           }
         } else {
           updatePaths(top, bot);
@@ -316,11 +303,31 @@ new p5((sk) => {
     }
 
     for (const letter of drawnLetters) {
-      drawWarpedLetter(sk, letter, videoOpacity);
+      drawWarpedLetter(sk, letter, videoOpacity, LETTER_COLOR);
+    }
+
+    if (strokeActive && topPath.length >= 2) {
+      const previewChar = message.charAt(messageIndex % message.length);
+      if (previewChar !== " ") {
+        const startTop = sampleAt(topPath, letterStartS);
+        const startBot = sampleAt(botPath, letterStartS);
+        const startHeight = Math.max(
+          MIN_LETTER_HEIGHT_PX,
+          Math.hypot(startTop.x - startBot.x, startTop.y - startBot.y),
+        );
+        const letterWidth = letterWidthForChar(previewChar, startHeight);
+        const availableWidth = Math.max(0, spineLen - letterStartS);
+        const fraction = Math.min(1, availableWidth / letterWidth);
+        if (fraction > 0) {
+          const previewEndS = letterStartS + availableWidth;
+          const previewEdges = buildLetterEdges(letterStartS, previewEndS);
+          drawWarpedLetterPartial(sk, { char: previewChar, edges: previewEdges }, videoOpacity, fraction, LETTER_COLOR);
+        }
+      }
     }
 
     sk.push();
-    sk.fill(255);
+    sk.fill(...LETTER_COLOR);
     sk.textSize(24);
     sk.textAlign(sk.RIGHT, sk.BOTTOM);
     sk.textFont("monospace");
