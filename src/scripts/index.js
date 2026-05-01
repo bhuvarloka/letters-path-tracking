@@ -194,13 +194,11 @@ new p5((sk) => {
             accumulatedDistance += distanceMoved;
 
             const currentChar = message.charAt(messageIndex % message.length);
-            const minSize = 24;
-            const fontSize = sk.constrain(
-              minSize + Math.log(distanceMoved + 1) * 60,
-              minSize,
+            const halfWidth = sk.constrain(
+              24 + Math.log(smoothVel + 1) * 60,
+              24,
               600,
-            );
-            const halfWidth = fontSize * LETTER_WIDTH_RATIO;
+            ) * LETTER_WIDTH_RATIO;
             const requiredDistance =
               currentChar === " " ? LETTER_SPACING * 2 : LETTER_SPACING;
 
@@ -219,21 +217,15 @@ new p5((sk) => {
                   MIN_THICKNESS,
                   MAX_THICKNESS,
                 );
-                const rawQuad = buildQuad(
-                  smoothX,
-                  smoothY,
-                  halfWidth,
-                  thick0,
-                  thick1,
-                );
                 drawnLetters.push({
                   char: currentChar,
-                  quad: {
-                    tl: { x: sx(rawQuad.tl.x), y: sy(rawQuad.tl.y) },
-                    tr: { x: sx(rawQuad.tr.x), y: sy(rawQuad.tr.y) },
-                    br: { x: sx(rawQuad.br.x), y: sy(rawQuad.br.y) },
-                    bl: { x: sx(rawQuad.bl.x), y: sy(rawQuad.bl.y) },
-                  },
+                  quad: buildQuad(
+                    sx(smoothX),
+                    sy(smoothY),
+                    halfWidth,
+                    thick0,
+                    thick1,
+                  ),
                 });
               }
               messageIndex++;
@@ -256,6 +248,7 @@ new p5((sk) => {
     sk.textSize(24);
     sk.textAlign(sk.RIGHT, sk.BOTTOM);
     sk.textFont("monospace");
+    // In WEBGL mode origin is center, so (sw(), sh()) is bottom-right corner.
     sk.text(
       drawingHand
         ? `${drawingHand.toUpperCase()} HAND ACTIVATED`

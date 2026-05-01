@@ -3,10 +3,12 @@ const MAX_VEL_CLAMP = 80;
 const CANVAS_W = 512;
 const CANVAS_H = 512;
 
-let sharedCanvas = null;
+let activeSketch = null;
+const glyphCache = new Map(); // char:fill -> p5.Graphics
 
 export function initLetterCanvas(sk) {
-  sharedCanvas = sk.createGraphics(CANVAS_W, CANVAS_H, sk.P2D);
+  activeSketch = sk;
+  glyphCache.clear();
 }
 
 export function velocityToThickness(vel, minThickness, maxThickness) {
@@ -25,34 +27,34 @@ export function buildQuad(cx, cy, halfWidth, thick0, thick1) {
   };
 }
 
+function getGlyphCanvas(sk, char, fill) {
+  const key = `${char}:${fill}`;
+  if (glyphCache.has(key)) return glyphCache.get(key);
+
+  const g = sk.createGraphics(CANVAS_W, CANVAS_H, sk.P2D);
+  g.textFont(sk._typeface);
+  g.textSize(CANVAS_H * 0.85);
+  g.textAlign(sk.CENTER, sk.CENTER);
+  g.noStroke();
+  g.fill(fill);
+  g.text(char, CANVAS_W / 2, CANVAS_H / 2);
+  glyphCache.set(key, g);
+  return g;
+}
+
 export function drawWarpedLetter(sk, letter, videoOpacity) {
   const { char, quad } = letter;
-  if (!sharedCanvas) return;
+  if (activeSketch !== sk) return;
 
-  // Measure quad dimensions to render glyph at correct aspect ratio
-  const quadW = Math.abs(quad.tr.x - quad.tl.x);
-  const quadH = Math.abs((quad.bl.y - quad.tl.y + (quad.br.y - quad.tr.y)) / 2);
-  const aspect = quadH > 0.001 ? quadW / quadH : 1;
-
-  // Scale textSize so the glyph fills canvas proportionally to the quad shape
-  const textH = CANVAS_H * 0.85;
-  const textW = textH * aspect;
-  const glyphSize = Math.min(textH, textW);
-
-  sharedCanvas.clear();
-  sharedCanvas.textFont(sk._typeface);
-  sharedCanvas.textSize(glyphSize);
-  sharedCanvas.textAlign(sk.CENTER, sk.CENTER);
-  sharedCanvas.noStroke();
-  sharedCanvas.fill(videoOpacity === 0 ? 0 : 255);
-  sharedCanvas.text(char, CANVAS_W / 2, CANVAS_H / 2);
+  const fill = videoOpacity === 0 ? 0 : 255;
+  const glyph = getGlyphCanvas(sk, char, fill);
 
   const G = GRID_SIZE;
   const { tl, tr, br, bl } = quad;
 
   sk.push();
   sk.noStroke();
-  sk.texture(sharedCanvas);
+  sk.texture(glyph);
   sk.beginShape(sk.TRIANGLES);
 
   for (let row = 0; row < G - 1; row++) {
