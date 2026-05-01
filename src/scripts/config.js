@@ -5,8 +5,8 @@ export const PINCH_CLOSED_THRESHOLD = 0.25;
 export const PINCH_OPEN_THRESHOLD = 0.5;
 
 export const MIN_LETTER_HEIGHT_PX = 24;
-export const LETTER_WIDTH_SCALE = 2.0;
-export const LETTER_GAP_RATIO = 0.2;
+export const LETTER_WIDTH_SCALE = 1.5;
+export const LETTER_GAP_RATIO = 0.05;
 export const SPACE_WIDTH_RATIO = 0.1;
 export const MAX_DRAWN_LETTERS = 320;
 
@@ -20,6 +20,6 @@ export const WARP_GRID_COLS = 32;
 export const WARP_GRID_ROWS = 4;
 export const GLYPH_RENDER_SIZE = 480;
 
-export const LETTER_COLOR = [0, 0, 255];
+export const LETTER_COLOR = [225, 255, 255];
 
 export const OPEN_PALM_COOLDOWN_MS = 1000;
