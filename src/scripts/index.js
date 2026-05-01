@@ -4,6 +4,12 @@ import { gestureMediaPipe } from "./gestureRecognizerMediaPipe";
 import { initializeCamCapture, updateFeedDimensions } from "./videoFeedUtils";
 import { getMappedLandmarks } from "./landmarksHandler";
 import { saveSnapshot, pulse } from "./utils";
+import {
+  velocityToThickness,
+  buildQuad,
+  drawWarpedLetter,
+  initLetterCanvas,
+} from "./letterWarp";
 import typeface from "../assets/fonts/LeagueGothicRegular.ttf";
 
 new p5((sk) => {
@@ -13,7 +19,7 @@ new p5((sk) => {
   const message = "EVERYWHERE IS THE SAME PLACE";
   let messageIndex = 0;
   let drawnLetters = [];
-  const MAX_LETTERS = 300;
+  const MAX_LETTERS = 320;
   let videoOpacity = 255;
   let drawingHand = null;
   let drawingActivatedAt = 0;
@@ -22,19 +28,27 @@ new p5((sk) => {
   let previousActivePos = null;
   let smoothX = 0;
   let smoothY = 0;
+  let smoothVel = 0;
+  let entryVel = 0;
+
   const EMA_ALPHA = 0.35;
   const MOVEMENT_THRESHOLD = 3;
-
   let lastVictoryTime = { left: 0, right: 0 };
   const VICTORY_COOLDOWN = 1000;
-
-  // Both-fists erase: must be held to avoid accidental trigger.
-  // Timer only resets if neither hand shows a fist, to tolerate momentary mis-reads.
   let bothFistsStartTime = 0;
   const ERASE_HOLD_MS = 800;
-
   let lastThumbDownTime = 0;
   const THUMB_DOWN_COOLDOWN = 500;
+
+  const LETTER_WIDTH_RATIO = 0.7; // halfWidth = fontSize * this
+  const LETTER_SPACING = 48; // px of hand travel before next letter fires
+  const MIN_THICKNESS = 8; // px, stroke height at min velocity
+  const MAX_THICKNESS = 480; // px, stroke height at max velocity
+
+  const sw = () => sk.width / 2;
+  const sh = () => sk.height / 2;
+  const sx = (x) => x - sw();
+  const sy = (y) => y - sh();
 
   sk.preload = () => {
     type = sk.loadFont(typeface);
@@ -42,10 +56,12 @@ new p5((sk) => {
 
   sk.setup = () => {
     defaultDensity = sk.displayDensity();
-    sk.createCanvas(sk.windowWidth, sk.windowHeight);
+    sk.createCanvas(sk.windowWidth, sk.windowHeight, sk.WEBGL);
+    sk._typeface = type;
     sk.textFont(type);
     sk.textAlign(sk.CENTER, sk.CENTER);
     sk.noStroke();
+    initLetterCanvas(sk);
     camFeed = initializeCamCapture(sk, [mediaPipe, gestureMediaPipe]);
   };
 
@@ -59,23 +75,26 @@ new p5((sk) => {
     return result;
   };
 
-  const activateHand = (hand, now) => {
-    lastVictoryTime[hand] = now;
-    drawingHand = hand;
-    drawingActivatedAt = now;
+  const resetDrawingState = () => {
     accumulatedDistance = 0;
     previousActivePos = null;
     smoothX = 0;
     smoothY = 0;
+    smoothVel = 0;
+    entryVel = 0;
+  };
+
+  const activateHand = (hand, now) => {
+    lastVictoryTime[hand] = now;
+    drawingHand = hand;
+    drawingActivatedAt = now;
+    resetDrawingState();
   };
 
   const deactivateHand = () => {
     drawingHand = null;
     drawingActivatedAt = 0;
-    accumulatedDistance = 0;
-    previousActivePos = null;
-    smoothX = 0;
-    smoothY = 0;
+    resetDrawingState();
   };
 
   sk.draw = () => {
@@ -86,8 +105,8 @@ new p5((sk) => {
       sk.tint(255, videoOpacity);
       sk.image(
         camFeed,
-        camFeed.x || 0,
-        camFeed.y || 0,
+        sx(camFeed.x || 0),
+        sy(camFeed.y || 0),
         camFeed.scaledWidth || sk.width,
         camFeed.scaledHeight || sk.height,
       );
@@ -96,17 +115,22 @@ new p5((sk) => {
     }
 
     const LM = getMappedLandmarks(sk, mediaPipe, camFeed, [21, 22]);
-
     const detected = getGesturesPerHand();
     const now = sk.millis();
 
     const leftHandGesture = detected.find((d) => d.hand === "Left")?.gesture;
     const rightHandGesture = detected.find((d) => d.hand === "Right")?.gesture;
 
-    if (leftHandGesture === "Victory" && now - lastVictoryTime.left > VICTORY_COOLDOWN) {
+    if (
+      leftHandGesture === "Victory" &&
+      now - lastVictoryTime.left > VICTORY_COOLDOWN
+    ) {
       activateHand("left", now);
     }
-    if (rightHandGesture === "Victory" && now - lastVictoryTime.right > VICTORY_COOLDOWN) {
+    if (
+      rightHandGesture === "Victory" &&
+      now - lastVictoryTime.right > VICTORY_COOLDOWN
+    ) {
       activateHand("right", now);
     }
 
@@ -133,7 +157,8 @@ new p5((sk) => {
       bothFistsStartTime = 0;
     }
 
-    const thumbDown = leftHandGesture === "Thumb_Down" || rightHandGesture === "Thumb_Down";
+    const thumbDown =
+      leftHandGesture === "Thumb_Down" || rightHandGesture === "Thumb_Down";
     if (thumbDown && now - lastThumbDownTime > THUMB_DOWN_COOLDOWN) {
       lastThumbDownTime = now;
       if (drawnLetters.length > 0) {
@@ -143,7 +168,8 @@ new p5((sk) => {
       }
     }
 
-    const isWarmedUp = drawingHand && (now - drawingActivatedAt >= DRAWING_WARMUP_MS);
+    const isWarmedUp =
+      drawingHand && now - drawingActivatedAt >= DRAWING_WARMUP_MS;
 
     if (isWarmedUp) {
       const rawX = drawingHand === "left" ? LM.X21 : LM.X22;
@@ -161,10 +187,12 @@ new p5((sk) => {
         if (previousActivePos !== null) {
           const dx = smoothX - previousActivePos.x;
           const dy = smoothY - previousActivePos.y;
-          const distanceMoved = sk.sqrt(dx * dx + dy * dy);
+          const distanceMoved = Math.sqrt(dx * dx + dy * dy);
 
           if (distanceMoved > MOVEMENT_THRESHOLD) {
+            smoothVel = EMA_ALPHA * distanceMoved + (1 - EMA_ALPHA) * smoothVel;
             accumulatedDistance += distanceMoved;
+
             const currentChar = message.charAt(messageIndex % message.length);
             const minSize = 24;
             const fontSize = sk.constrain(
@@ -172,22 +200,45 @@ new p5((sk) => {
               minSize,
               600,
             );
+            const halfWidth = fontSize * LETTER_WIDTH_RATIO;
             const requiredDistance =
-              (currentChar === " " ? 50 : 30) *
-              (1 + (fontSize / minSize - 1) * 0.2);
+              currentChar === " " ? LETTER_SPACING * 2 : LETTER_SPACING;
+
+            if (entryVel === 0) entryVel = smoothVel;
 
             if (accumulatedDistance >= requiredDistance) {
               if (currentChar !== " ") {
                 if (drawnLetters.length >= MAX_LETTERS) drawnLetters.shift();
+                const thick0 = velocityToThickness(
+                  entryVel,
+                  MIN_THICKNESS,
+                  MAX_THICKNESS,
+                );
+                const thick1 = velocityToThickness(
+                  smoothVel,
+                  MIN_THICKNESS,
+                  MAX_THICKNESS,
+                );
+                const rawQuad = buildQuad(
+                  smoothX,
+                  smoothY,
+                  halfWidth,
+                  thick0,
+                  thick1,
+                );
                 drawnLetters.push({
                   char: currentChar,
-                  x: smoothX,
-                  y: smoothY,
-                  size: fontSize,
+                  quad: {
+                    tl: { x: sx(rawQuad.tl.x), y: sy(rawQuad.tl.y) },
+                    tr: { x: sx(rawQuad.tr.x), y: sy(rawQuad.tr.y) },
+                    br: { x: sx(rawQuad.br.x), y: sy(rawQuad.br.y) },
+                    bl: { x: sx(rawQuad.bl.x), y: sy(rawQuad.bl.y) },
+                  },
                 });
               }
               messageIndex++;
               accumulatedDistance = 0;
+              entryVel = 0;
             }
           }
         }
@@ -196,23 +247,22 @@ new p5((sk) => {
       }
     }
 
-    sk.push();
-    sk.fill(videoOpacity === 0 ? 0 : 255);
     for (const letter of drawnLetters) {
-      sk.textSize(letter.size);
-      sk.text(letter.char, letter.x, letter.y);
+      drawWarpedLetter(sk, letter, videoOpacity);
     }
-    sk.pop();
 
     sk.push();
     sk.fill(255);
     sk.textSize(24);
     sk.textAlign(sk.RIGHT, sk.BOTTOM);
     sk.textFont("monospace");
-    const statusText = drawingHand
-      ? `${drawingHand.toUpperCase()} HAND ACTIVATED`
-      : "NO HAND ACTIVATED";
-    sk.text(statusText, sk.width - 20, sk.height - 20);
+    sk.text(
+      drawingHand
+        ? `${drawingHand.toUpperCase()} HAND ACTIVATED`
+        : "NO HAND ACTIVATED",
+      sw() - 20,
+      sh() - 20,
+    );
     sk.pop();
 
     if (drawingHand) {
@@ -224,13 +274,10 @@ new p5((sk) => {
         sk.push();
         sk.stroke(255, 0, 0);
         sk.strokeWeight(2);
-        if (isWarmedUp) {
-          sk.fill(255, 0, 0);
-        } else {
-          sk.noFill();
-        }
+        if (isWarmedUp) sk.fill(255, 0, 0);
+        else sk.noFill();
         const size = pulse(sk, 16, 32, 60);
-        sk.ellipse(activeX, activeY, size, size);
+        sk.ellipse(sx(activeX), sy(activeY), size, size);
         sk.pop();
       }
     }
