@@ -1,31 +1,35 @@
-export const getMappedLandmarks = (sketch, mediaPipe, camFeed, indices) => {
-  const mappedLandmarks = {};
+const mapLandmark = (sketch, lm, camFeed) => ({
+  x: sketch.map(
+    lm.x,
+    1,
+    0,
+    camFeed.x || 0,
+    (camFeed.x || 0) + (camFeed.scaledWidth || sketch.width),
+  ),
+  y: sketch.map(
+    lm.y,
+    0,
+    1,
+    camFeed.y || 0,
+    (camFeed.y || 0) + (camFeed.scaledHeight || sketch.height),
+  ),
+});
 
-  if (mediaPipe.landmarks.length > 0 && mediaPipe.landmarks[0]) {
-    indices.forEach((index) => {
-      if (mediaPipe.landmarks[0][index]) {
-        const LMX = `X${index}`;
-        const LMY = `Y${index}`;
+export const getHandLandmarks = (sketch, gestureMP, camFeed, indices) => {
+  const hands = [];
+  const handsLandmarks = gestureMP.landmarks || [];
+  const handedness = gestureMP.handedness || [];
 
-        // Map landmarks to video feed dimensions and add offset for proper positioning
-        mappedLandmarks[LMX] = sketch.map(
-          mediaPipe.landmarks[0][index].x,
-          1,
-          0,
-          camFeed.x || 0,
-          (camFeed.x || 0) + (camFeed.scaledWidth || sketch.width)
-        );
+  for (let i = 0; i < handsLandmarks.length; i++) {
+    const lms = handsLandmarks[i];
+    const hand = handedness[i]?.[0]?.displayName;
+    if (!lms || !hand) continue;
 
-        mappedLandmarks[LMY] = sketch.map(
-          mediaPipe.landmarks[0][index].y,
-          0,
-          1,
-          camFeed.y || 0,
-          (camFeed.y || 0) + (camFeed.scaledHeight || sketch.height)
-        );
-      }
+    const points = {};
+    indices.forEach((idx) => {
+      if (lms[idx]) points[idx] = mapLandmark(sketch, lms[idx], camFeed);
     });
+    hands.push({ hand, points });
   }
-
-  return mappedLandmarks;
+  return hands;
 };

@@ -1,16 +1,20 @@
 import p5 from "p5";
-import { mediaPipe } from "./poseModelMediaPipe";
 import { gestureMediaPipe } from "./gestureRecognizerMediaPipe";
 import { initializeCamCapture, updateFeedDimensions } from "./videoFeedUtils";
-import { getMappedLandmarks } from "./landmarksHandler";
+import { getHandLandmarks } from "./landmarksHandler";
 import { saveSnapshot, pulse } from "./utils";
 import {
-  velocityToThickness,
-  buildQuad,
+  buildQuadFromEdges,
   drawWarpedLetter,
   initLetterCanvas,
+  getGlyphAspect,
 } from "./letterWarp";
 import typeface from "../assets/fonts/LeagueGothicRegular.ttf";
+
+const WRIST = 0;
+const THUMB_TIP = 4;
+const INDEX_TIP = 8;
+const MIDDLE_MCP = 9;
 
 new p5((sk) => {
   let camFeed;
@@ -21,29 +25,34 @@ new p5((sk) => {
   let drawnLetters = [];
   const MAX_LETTERS = 320;
   let videoOpacity = 255;
+
   let drawingHand = null;
   let drawingActivatedAt = 0;
   const DRAWING_WARMUP_MS = 1000;
-  let accumulatedDistance = 0;
-  let previousActivePos = null;
-  let smoothX = 0;
-  let smoothY = 0;
-  let smoothVel = 0;
-  let entryVel = 0;
 
-  const EMA_ALPHA = 0.35;
-  const MOVEMENT_THRESHOLD = 3;
-  let lastVictoryTime = { left: 0, right: 0 };
-  const VICTORY_COOLDOWN = 1000;
+  let strokeActive = false;
+  let pinchClosedSeen = false;
+  let topPath = [];
+  let botPath = [];
+  let spineLen = 0;
+  let letterStartS = 0;
+
+  let smoothTop = null;
+  let smoothBot = null;
+  const EMA_ALPHA = 0.4;
+
+  const PINCH_CLOSED_RATIO = 0.25;
+  const PINCH_OPEN_RATIO = 0.5;
+  const MIN_LETTER_HEIGHT = 24;
+  const LETTER_TRACKING = 0.05;
+  const SPACE_WIDTH_RATIO = 0.35;
+
+  let lastActivateTime = { Left: 0, Right: 0 };
+  const ACTIVATE_COOLDOWN = 1000;
   let bothFistsStartTime = 0;
   const ERASE_HOLD_MS = 800;
   let lastThumbDownTime = 0;
   const THUMB_DOWN_COOLDOWN = 500;
-
-  const LETTER_WIDTH_RATIO = 0.7; // halfWidth = fontSize * this
-  const LETTER_SPACING = 48; // px of hand travel before next letter fires
-  const MIN_THICKNESS = 8; // px, stroke height at min velocity
-  const MAX_THICKNESS = 480; // px, stroke height at max velocity
 
   const sw = () => sk.width / 2;
   const sh = () => sk.height / 2;
@@ -62,39 +71,139 @@ new p5((sk) => {
     sk.textAlign(sk.CENTER, sk.CENTER);
     sk.noStroke();
     initLetterCanvas(sk);
-    camFeed = initializeCamCapture(sk, [mediaPipe, gestureMediaPipe]);
+    camFeed = initializeCamCapture(sk, [gestureMediaPipe]);
   };
 
   const getGesturesPerHand = () => {
-    const result = [];
+    const result = {};
     for (let i = 0; i < gestureMediaPipe.gestures.length; i++) {
       const gesture = gestureMediaPipe.gestures[i]?.[0]?.categoryName;
       const hand = gestureMediaPipe.handedness[i]?.[0]?.displayName;
-      if (gesture && hand) result.push({ gesture, hand });
+      if (gesture && hand) result[hand] = gesture;
     }
     return result;
   };
 
-  const resetDrawingState = () => {
-    accumulatedDistance = 0;
-    previousActivePos = null;
-    smoothX = 0;
-    smoothY = 0;
-    smoothVel = 0;
-    entryVel = 0;
+  const resetStroke = () => {
+    strokeActive = false;
+    pinchClosedSeen = false;
+    topPath = [];
+    botPath = [];
+    spineLen = 0;
+    letterStartS = 0;
+    smoothTop = null;
+    smoothBot = null;
   };
 
   const activateHand = (hand, now) => {
-    lastVictoryTime[hand] = now;
+    lastActivateTime[hand] = now;
     drawingHand = hand;
     drawingActivatedAt = now;
-    resetDrawingState();
+    resetStroke();
   };
 
   const deactivateHand = () => {
     drawingHand = null;
     drawingActivatedAt = 0;
-    resetDrawingState();
+    resetStroke();
+  };
+
+  const advanceForChar = (char, height) => {
+    if (char === " ") return height * SPACE_WIDTH_RATIO;
+    const aspect = getGlyphAspect(sk, char);
+    return height * aspect * (1 + LETTER_TRACKING);
+  };
+
+  const sampleAt = (path, s) => {
+    if (path.length === 0) return null;
+    if (s <= path[0].s) return { x: path[0].x, y: path[0].y };
+    for (let i = 1; i < path.length; i++) {
+      if (path[i].s >= s) {
+        const a = path[i - 1];
+        const b = path[i];
+        const seg = b.s - a.s;
+        const t = seg > 0 ? (s - a.s) / seg : 0;
+        return {
+          x: a.x + (b.x - a.x) * t,
+          y: a.y + (b.y - a.y) * t,
+        };
+      }
+    }
+    const last = path[path.length - 1];
+    return { x: last.x, y: last.y };
+  };
+
+  const commitLetterIfReady = () => {
+    while (messageIndex < Number.MAX_SAFE_INTEGER) {
+      const char = message.charAt(messageIndex % message.length);
+      const startTop = sampleAt(topPath, letterStartS);
+      const startBot = sampleAt(botPath, letterStartS);
+      if (!startTop || !startBot) return;
+
+      const startHeight = Math.max(
+        MIN_LETTER_HEIGHT,
+        Math.hypot(startTop.x - startBot.x, startTop.y - startBot.y),
+      );
+      const advance = advanceForChar(char, startHeight);
+      const endS = letterStartS + advance;
+
+      if (spineLen < endS) return;
+
+      const endTop = sampleAt(topPath, endS);
+      const endBot = sampleAt(botPath, endS);
+
+      if (char !== " ") {
+        if (drawnLetters.length >= MAX_LETTERS) drawnLetters.shift();
+        drawnLetters.push({
+          char,
+          quad: buildQuadFromEdges(
+            sx(startTop.x),
+            sx(endTop.x),
+            sy(startTop.y),
+            sy(endTop.y),
+            sy(startBot.y),
+            sy(endBot.y),
+          ),
+        });
+      }
+
+      messageIndex++;
+      letterStartS = endS;
+    }
+  };
+
+  const updatePaths = (top, bot) => {
+    if (smoothTop === null) {
+      smoothTop = { ...top };
+      smoothBot = { ...bot };
+    } else {
+      smoothTop.x = EMA_ALPHA * top.x + (1 - EMA_ALPHA) * smoothTop.x;
+      smoothTop.y = EMA_ALPHA * top.y + (1 - EMA_ALPHA) * smoothTop.y;
+      smoothBot.x = EMA_ALPHA * bot.x + (1 - EMA_ALPHA) * smoothBot.x;
+      smoothBot.y = EMA_ALPHA * bot.y + (1 - EMA_ALPHA) * smoothBot.y;
+    }
+
+    const midX = (smoothTop.x + smoothBot.x) / 2;
+    const midY = (smoothTop.y + smoothBot.y) / 2;
+
+    if (topPath.length === 0) {
+      topPath.push({ x: smoothTop.x, y: smoothTop.y, s: 0 });
+      botPath.push({ x: smoothBot.x, y: smoothBot.y, s: 0 });
+      spineLen = 0;
+      return;
+    }
+
+    const lastTop = topPath[topPath.length - 1];
+    const lastBot = botPath[botPath.length - 1];
+    const lastMidX = (lastTop.x + lastBot.x) / 2;
+    const lastMidY = (lastTop.y + lastBot.y) / 2;
+    const ds = Math.hypot(midX - lastMidX, midY - lastMidY);
+
+    if (ds < 1) return;
+
+    spineLen += ds;
+    topPath.push({ x: smoothTop.x, y: smoothTop.y, s: spineLen });
+    botPath.push({ x: smoothBot.x, y: smoothBot.y, s: spineLen });
   };
 
   sk.draw = () => {
@@ -114,128 +223,95 @@ new p5((sk) => {
       sk.pop();
     }
 
-    const LM = getMappedLandmarks(sk, mediaPipe, camFeed, [21, 22]);
-    const detected = getGesturesPerHand();
+    const hands = getHandLandmarks(sk, gestureMediaPipe, camFeed, [
+      WRIST,
+      THUMB_TIP,
+      INDEX_TIP,
+      MIDDLE_MCP,
+    ]);
+    const gesturesByHand = getGesturesPerHand();
     const now = sk.millis();
 
-    const leftHandGesture = detected.find((d) => d.hand === "Left")?.gesture;
-    const rightHandGesture = detected.find((d) => d.hand === "Right")?.gesture;
+    const handByName = (name) => hands.find((h) => h.hand === name);
 
     if (
-      leftHandGesture === "Victory" &&
-      now - lastVictoryTime.left > VICTORY_COOLDOWN
+      gesturesByHand.Left === "ILoveYou" &&
+      now - lastActivateTime.Left > ACTIVATE_COOLDOWN
     ) {
-      activateHand("left", now);
+      activateHand("Left", now);
     }
     if (
-      rightHandGesture === "Victory" &&
-      now - lastVictoryTime.right > VICTORY_COOLDOWN
+      gesturesByHand.Right === "ILoveYou" &&
+      now - lastActivateTime.Right > ACTIVATE_COOLDOWN
     ) {
-      activateHand("right", now);
+      activateHand("Right", now);
     }
 
-    const activeHandGesture =
-      drawingHand === "left" ? leftHandGesture : rightHandGesture;
-    if (drawingHand && activeHandGesture === "Closed_Fist") {
+    const activeGesture = drawingHand ? gesturesByHand[drawingHand] : null;
+    if (drawingHand && activeGesture === "Closed_Fist") {
       deactivateHand();
     }
 
-    const leftIsFist = leftHandGesture === "Closed_Fist";
-    const rightIsFist = rightHandGesture === "Closed_Fist";
-    const bothFists = leftIsFist && rightIsFist;
-    const eitherFist = leftIsFist || rightIsFist;
-    if (bothFists) {
+    const leftIsFist = gesturesByHand.Left === "Closed_Fist";
+    const rightIsFist = gesturesByHand.Right === "Closed_Fist";
+    if (leftIsFist && rightIsFist) {
       if (bothFistsStartTime === 0) bothFistsStartTime = now;
       if (now - bothFistsStartTime > ERASE_HOLD_MS) {
         drawnLetters = [];
         messageIndex = 0;
-        accumulatedDistance = 0;
         bothFistsStartTime = 0;
         deactivateHand();
       }
-    } else if (!eitherFist) {
+    } else if (!leftIsFist && !rightIsFist) {
       bothFistsStartTime = 0;
     }
 
     const thumbDown =
-      leftHandGesture === "Thumb_Down" || rightHandGesture === "Thumb_Down";
+      gesturesByHand.Left === "Thumb_Down" ||
+      gesturesByHand.Right === "Thumb_Down";
     if (thumbDown && now - lastThumbDownTime > THUMB_DOWN_COOLDOWN) {
       lastThumbDownTime = now;
       if (drawnLetters.length > 0) {
         drawnLetters.pop();
         messageIndex = Math.max(0, messageIndex - 1);
-        accumulatedDistance = 0;
       }
     }
 
     const isWarmedUp =
       drawingHand && now - drawingActivatedAt >= DRAWING_WARMUP_MS;
 
-    if (isWarmedUp) {
-      const rawX = drawingHand === "left" ? LM.X21 : LM.X22;
-      const rawY = drawingHand === "left" ? LM.Y21 : LM.Y22;
+    let activeHandData = null;
+    if (drawingHand) activeHandData = handByName(drawingHand);
 
-      if (rawX !== undefined) {
-        if (previousActivePos === null) {
-          smoothX = rawX;
-          smoothY = rawY;
-        } else {
-          smoothX = EMA_ALPHA * rawX + (1 - EMA_ALPHA) * smoothX;
-          smoothY = EMA_ALPHA * rawY + (1 - EMA_ALPHA) * smoothY;
-        }
+    if (isWarmedUp && activeHandData) {
+      const idx = activeHandData.points[INDEX_TIP];
+      const thb = activeHandData.points[THUMB_TIP];
+      const wrist = activeHandData.points[WRIST];
+      const mcp = activeHandData.points[MIDDLE_MCP];
 
-        if (previousActivePos !== null) {
-          const dx = smoothX - previousActivePos.x;
-          const dy = smoothY - previousActivePos.y;
-          const distanceMoved = Math.sqrt(dx * dx + dy * dy);
+      if (idx && thb && wrist && mcp) {
+        const top = idx.y < thb.y ? idx : thb;
+        const bot = idx.y < thb.y ? thb : idx;
+        const pinchDist = Math.hypot(idx.x - thb.x, idx.y - thb.y);
+        const palmSize = Math.hypot(wrist.x - mcp.x, wrist.y - mcp.y);
+        const pinchRatio = palmSize > 0 ? pinchDist / palmSize : 0;
 
-          if (distanceMoved > MOVEMENT_THRESHOLD) {
-            smoothVel = EMA_ALPHA * distanceMoved + (1 - EMA_ALPHA) * smoothVel;
-            accumulatedDistance += distanceMoved;
-
-            const currentChar = message.charAt(messageIndex % message.length);
-            const halfWidth = sk.constrain(
-              24 + Math.log(smoothVel + 1) * 60,
-              24,
-              600,
-            ) * LETTER_WIDTH_RATIO;
-            const requiredDistance =
-              currentChar === " " ? LETTER_SPACING * 2 : LETTER_SPACING;
-
-            if (entryVel === 0) entryVel = smoothVel;
-
-            if (accumulatedDistance >= requiredDistance) {
-              if (currentChar !== " ") {
-                if (drawnLetters.length >= MAX_LETTERS) drawnLetters.shift();
-                const thick0 = velocityToThickness(
-                  entryVel,
-                  MIN_THICKNESS,
-                  MAX_THICKNESS,
-                );
-                const thick1 = velocityToThickness(
-                  smoothVel,
-                  MIN_THICKNESS,
-                  MAX_THICKNESS,
-                );
-                drawnLetters.push({
-                  char: currentChar,
-                  quad: buildQuad(
-                    sx(smoothX),
-                    sy(smoothY),
-                    halfWidth,
-                    thick0,
-                    thick1,
-                  ),
-                });
-              }
-              messageIndex++;
-              accumulatedDistance = 0;
-              entryVel = 0;
-            }
+        if (!strokeActive) {
+          if (!pinchClosedSeen) {
+            if (pinchRatio < PINCH_CLOSED_RATIO) pinchClosedSeen = true;
+          } else if (pinchRatio > PINCH_OPEN_RATIO) {
+            strokeActive = true;
+            topPath = [];
+            botPath = [];
+            spineLen = 0;
+            letterStartS = 0;
+            smoothTop = null;
+            smoothBot = null;
           }
+        } else {
+          updatePaths(top, bot);
+          commitLetterIfReady();
         }
-
-        previousActivePos = { x: smoothX, y: smoothY };
       }
     }
 
@@ -248,29 +324,34 @@ new p5((sk) => {
     sk.textSize(24);
     sk.textAlign(sk.RIGHT, sk.BOTTOM);
     sk.textFont("monospace");
-    // In WEBGL mode origin is center, so (sw(), sh()) is bottom-right corner.
-    sk.text(
-      drawingHand
-        ? `${drawingHand.toUpperCase()} HAND ACTIVATED`
-        : "NO HAND ACTIVATED",
-      sw() - 20,
-      sh() - 20,
-    );
+    const status = !drawingHand
+      ? "NO HAND ACTIVATED — I LOVE YOU TO START"
+      : !isWarmedUp
+        ? `${drawingHand.toUpperCase()} HAND WARMING UP`
+        : strokeActive
+          ? `${drawingHand.toUpperCase()} HAND DRAWING`
+          : !pinchClosedSeen
+            ? `${drawingHand.toUpperCase()} HAND — PINCH TIPS TOGETHER`
+            : `${drawingHand.toUpperCase()} HAND — RELEASE TO DRAW`;
+    sk.text(status, sw() - 20, sh() - 20);
     sk.pop();
 
-    if (drawingHand) {
-      const rawActiveX = drawingHand === "left" ? LM.X21 : LM.X22;
-      const rawActiveY = drawingHand === "left" ? LM.Y21 : LM.Y22;
-      const activeX = isWarmedUp ? smoothX : rawActiveX;
-      const activeY = isWarmedUp ? smoothY : rawActiveY;
-      if (activeX !== undefined) {
+    if (drawingHand && activeHandData) {
+      const idx = activeHandData.points[INDEX_TIP];
+      const thb = activeHandData.points[THUMB_TIP];
+      if (idx && thb) {
         sk.push();
         sk.stroke(255, 0, 0);
         sk.strokeWeight(2);
-        if (isWarmedUp) sk.fill(255, 0, 0);
+        if (strokeActive) sk.fill(255, 0, 0);
         else sk.noFill();
         const size = pulse(sk, 16, 32, 60);
-        sk.ellipse(sx(activeX), sy(activeY), size, size);
+        sk.ellipse(sx(idx.x), sy(idx.y), size, size);
+        sk.ellipse(sx(thb.x), sy(thb.y), size, size);
+        if (isWarmedUp) {
+          sk.stroke(255, 0, 0, strokeActive ? 255 : 100);
+          sk.line(sx(idx.x), sy(idx.y), sx(thb.x), sy(thb.y));
+        }
         sk.pop();
       }
     }
@@ -289,7 +370,7 @@ new p5((sk) => {
     } else if (sk.key === "c" || sk.key === "C") {
       drawnLetters = [];
       messageIndex = 0;
-      accumulatedDistance = 0;
+      resetStroke();
     }
   };
 });

@@ -1,43 +1,84 @@
 const GRID_SIZE = 12;
-const MAX_VEL_CLAMP = 80;
-const CANVAS_W = 512;
-const CANVAS_H = 512;
+const RENDER_SIZE = 480;
 
 let activeSketch = null;
-const glyphCache = new Map(); // char:fill -> p5.Graphics
+const glyphCache = new Map();
 
 export function initLetterCanvas(sk) {
   activeSketch = sk;
   glyphCache.clear();
 }
 
-export function velocityToThickness(vel, minThickness, maxThickness) {
-  const t = Math.min(vel / MAX_VEL_CLAMP, 1);
-  return minThickness + t * (maxThickness - minThickness);
+export function buildQuadFromEdges(xLeft, xRight, topLeftY, topRightY, botLeftY, botRightY) {
+  return {
+    tl: { x: xLeft, y: topLeftY },
+    tr: { x: xRight, y: topRightY },
+    br: { x: xRight, y: botRightY },
+    bl: { x: xLeft, y: botLeftY },
+  };
 }
 
-export function buildQuad(cx, cy, halfWidth, thick0, thick1) {
-  const x0 = cx - halfWidth;
-  const x1 = cx + halfWidth;
-  return {
-    tl: { x: x0, y: cy - thick0 / 2 },
-    tr: { x: x1, y: cy - thick1 / 2 },
-    br: { x: x1, y: cy + thick1 / 2 },
-    bl: { x: x0, y: cy + thick0 / 2 },
-  };
+export function getGlyphAspect(sk, char, fill = 255) {
+  const g = getGlyphCanvas(sk, char, fill);
+  return g.height > 0 ? g.width / g.height : 1;
 }
 
 function getGlyphCanvas(sk, char, fill) {
   const key = `${char}:${fill}`;
   if (glyphCache.has(key)) return glyphCache.get(key);
 
-  const g = sk.createGraphics(CANVAS_W, CANVAS_H, sk.P2D);
-  g.textFont(sk._typeface);
-  g.textSize(CANVAS_H * 0.85);
-  g.textAlign(sk.CENTER, sk.CENTER);
-  g.noStroke();
-  g.fill(fill);
-  g.text(char, CANVAS_W / 2, CANVAS_H / 2);
+  sk.push();
+  sk.textFont(sk._typeface);
+  sk.textSize(RENDER_SIZE);
+  const advance = Math.max(1, Math.ceil(sk.textWidth(char)));
+  const ascent = sk.textAscent();
+  const descent = sk.textDescent();
+  sk.pop();
+
+  const PAD = Math.ceil(RENDER_SIZE * 0.5);
+  const bakeW = advance + PAD * 2;
+  const bakeH = Math.ceil(ascent + descent) + PAD * 2;
+
+  const bake = sk.createGraphics(bakeW, bakeH, sk.P2D);
+  bake.pixelDensity(1);
+  bake.textFont(sk._typeface);
+  bake.textSize(RENDER_SIZE);
+  bake.textAlign(sk.LEFT, sk.BASELINE);
+  bake.noStroke();
+  bake.fill(fill);
+  bake.text(char, PAD, PAD + ascent);
+  bake.loadPixels();
+
+  const isInk = fill === 0
+    ? (r, g_, b, a) => a > 8 && (r + g_ + b) / 3 < 200
+    : (r, g_, b, a) => a > 8 && (r + g_ + b) / 3 > 55;
+
+  let minX = bakeW, minY = bakeH, maxX = -1, maxY = -1;
+  const px = bake.pixels;
+  for (let y = 0; y < bakeH; y++) {
+    for (let x = 0; x < bakeW; x++) {
+      const i = (y * bakeW + x) * 4;
+      if (isInk(px[i], px[i + 1], px[i + 2], px[i + 3])) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < 0) {
+    const empty = sk.createGraphics(1, 1, sk.P2D);
+    glyphCache.set(key, empty);
+    return empty;
+  }
+
+  const cropW = maxX - minX + 1;
+  const cropH = maxY - minY + 1;
+  const g = sk.createGraphics(cropW, cropH, sk.P2D);
+  g.pixelDensity(1);
+  g.clear();
+  g.image(bake, 0, 0, cropW, cropH, minX, minY, cropW, cropH);
   glyphCache.set(key, g);
   return g;
 }
@@ -77,8 +118,8 @@ export function drawWarpedLetter(sk, letter, videoOpacity) {
         sk.vertex(
           (1 - v) * topX + v * botX,
           (1 - v) * topY + v * botY,
-          u * CANVAS_W,
-          v * CANVAS_H,
+          u * glyph.width,
+          v * glyph.height,
         );
       }
     }
