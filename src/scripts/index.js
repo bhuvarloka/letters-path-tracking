@@ -3,7 +3,13 @@ import { gestureMediaPipe } from "./gestureRecognizerMediaPipe";
 import { initializeCamCapture, updateFeedDimensions } from "./videoFeedUtils";
 import { getHandLandmarks } from "./landmarksHandler";
 import { saveSnapshot, pulse } from "./utils";
-import { buildEdges, drawWarpedLetter, drawWarpedLetterPartial, initLetterCanvas, getGlyphAspect } from "./letterWarp";
+import {
+  buildEdges,
+  drawWarpedLetter,
+  drawWarpedLetterPartial,
+  initLetterCanvas,
+  getGlyphAspect,
+} from "./letterWarp";
 import {
   DRAWING_WARMUP_MS,
   HAND_ACTIVATE_COOLDOWN_MS,
@@ -22,7 +28,7 @@ import {
   LETTER_COLOR,
   OPEN_PALM_COOLDOWN_MS,
 } from "./config";
-import typeface from "../assets/fonts/LeagueGothicRegular.ttf";
+import typeface from "../assets/fonts/ABCOracle-Bold.ttf";
 
 const WRIST = 0;
 const THUMB_TIP = 4;
@@ -165,7 +171,10 @@ new p5((sk) => {
 
       if (char !== " ") {
         if (drawnLetters.length >= MAX_DRAWN_LETTERS) drawnLetters.shift();
-        drawnLetters.push({ char, edges: buildLetterEdges(letterStartS, glyphEndS) });
+        drawnLetters.push({
+          char,
+          edges: buildLetterEdges(letterStartS, glyphEndS),
+        });
       }
 
       messageIndex++;
@@ -178,10 +187,14 @@ new p5((sk) => {
       smoothTop = { ...top };
       smoothBot = { ...bot };
     } else {
-      smoothTop.x = SMOOTH_EMA_ALPHA * top.x + (1 - SMOOTH_EMA_ALPHA) * smoothTop.x;
-      smoothTop.y = SMOOTH_EMA_ALPHA * top.y + (1 - SMOOTH_EMA_ALPHA) * smoothTop.y;
-      smoothBot.x = SMOOTH_EMA_ALPHA * bot.x + (1 - SMOOTH_EMA_ALPHA) * smoothBot.x;
-      smoothBot.y = SMOOTH_EMA_ALPHA * bot.y + (1 - SMOOTH_EMA_ALPHA) * smoothBot.y;
+      smoothTop.x =
+        SMOOTH_EMA_ALPHA * top.x + (1 - SMOOTH_EMA_ALPHA) * smoothTop.x;
+      smoothTop.y =
+        SMOOTH_EMA_ALPHA * top.y + (1 - SMOOTH_EMA_ALPHA) * smoothTop.y;
+      smoothBot.x =
+        SMOOTH_EMA_ALPHA * bot.x + (1 - SMOOTH_EMA_ALPHA) * smoothBot.x;
+      smoothBot.y =
+        SMOOTH_EMA_ALPHA * bot.y + (1 - SMOOTH_EMA_ALPHA) * smoothBot.y;
     }
 
     const midX = (smoothTop.x + smoothBot.x) / 2;
@@ -225,17 +238,26 @@ new p5((sk) => {
     }
 
     const hands = getHandLandmarks(sk, gestureMediaPipe, camFeed, [
-      WRIST, THUMB_TIP, INDEX_TIP, MIDDLE_MCP,
+      WRIST,
+      THUMB_TIP,
+      INDEX_TIP,
+      MIDDLE_MCP,
     ]);
     const gesturesByHand = getGesturesPerHand();
     const now = sk.millis();
 
     const handByName = (name) => hands.find((h) => h.hand === name);
 
-    if (gesturesByHand.Left === "ILoveYou" && now - lastActivateTime.Left > HAND_ACTIVATE_COOLDOWN_MS) {
+    if (
+      gesturesByHand.Left === "ILoveYou" &&
+      now - lastActivateTime.Left > HAND_ACTIVATE_COOLDOWN_MS
+    ) {
       activateHand("Left", now);
     }
-    if (gesturesByHand.Right === "ILoveYou" && now - lastActivateTime.Right > HAND_ACTIVATE_COOLDOWN_MS) {
+    if (
+      gesturesByHand.Right === "ILoveYou" &&
+      now - lastActivateTime.Right > HAND_ACTIVATE_COOLDOWN_MS
+    ) {
       activateHand("Right", now);
     }
 
@@ -257,7 +279,9 @@ new p5((sk) => {
       bothFistsStartTime = 0;
     }
 
-    const thumbDown = gesturesByHand.Left === "Thumb_Down" || gesturesByHand.Right === "Thumb_Down";
+    const thumbDown =
+      gesturesByHand.Left === "Thumb_Down" ||
+      gesturesByHand.Right === "Thumb_Down";
     if (thumbDown && now - lastThumbDownTime > THUMB_DOWN_COOLDOWN_MS) {
       lastThumbDownTime = now;
       if (drawnLetters.length > 0) {
@@ -266,13 +290,16 @@ new p5((sk) => {
       }
     }
 
-    const bothPalmsOpen = gesturesByHand.Left === "Open_Palm" && gesturesByHand.Right === "Open_Palm";
+    const bothPalmsOpen =
+      gesturesByHand.Left === "Open_Palm" &&
+      gesturesByHand.Right === "Open_Palm";
     if (bothPalmsOpen && now - lastOpenPalmTime > OPEN_PALM_COOLDOWN_MS) {
       lastOpenPalmTime = now;
       videoOpacity = videoOpacity === 255 ? 0 : 255;
     }
 
-    const isWarmedUp = drawingHand && now - drawingActivatedAt >= DRAWING_WARMUP_MS;
+    const isWarmedUp =
+      drawingHand && now - drawingActivatedAt >= DRAWING_WARMUP_MS;
     const activeHandData = drawingHand ? handByName(drawingHand) : null;
 
     if (isWarmedUp && activeHandData) {
@@ -321,7 +348,13 @@ new p5((sk) => {
         if (fraction > 0) {
           const previewEndS = letterStartS + availableWidth;
           const previewEdges = buildLetterEdges(letterStartS, previewEndS);
-          drawWarpedLetterPartial(sk, { char: previewChar, edges: previewEdges }, videoOpacity, fraction, LETTER_COLOR);
+          drawWarpedLetterPartial(
+            sk,
+            { char: previewChar, edges: previewEdges },
+            videoOpacity,
+            fraction,
+            LETTER_COLOR,
+          );
         }
       }
     }
